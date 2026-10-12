@@ -1,0 +1,577 @@
+// Elite Pest Control — Prisma schema
+// Maps directly to the User Manual v3 data model.
+// Local development uses MySQL. Set DATABASE_URL in .env.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- 2. User Roles ----------
+enum Role {
+  ADMIN
+  MANAGER
+  SALES
+  TECHNICIAN
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role     @default(SALES)
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  quotationsCreated   Quotation[]   @relation("QuotationCreatedBy")
+  auditLogs           AuditLog[]
+  enquiriesCreated    Enquiry[]     @relation("EnquiryCreatedBy")
+  followUpsAssigned   FollowUp[]    @relation("FollowUpAssignedTo")
+  jobsCreated         Job[]         @relation("JobCreatedBy")
+  paymentsRecorded    Payment[]     @relation("PaymentRecordedBy")
+  amcContractsCreated AMCContract[] @relation("AMCCreatedBy")
+
+  technician Technician?
+}
+
+// ---------- 4. Customers ----------
+model Customer {
+  id        String   @id @default(cuid())
+  name      String
+  mobile    String
+  email     String?
+  address   String?
+  gstNumber String?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  properties   Property[]
+  quotations   Quotation[]
+  enquiries    Enquiry[]
+  followUps    FollowUp[]
+  jobs         Job[]
+  invoices     Invoice[]
+  amcContracts AMCContract[]
+
+  @@index([mobile])
+  @@index([name])
+  @@index([deletedAt])
+}
+
+// ---------- 5. Properties ----------
+enum PropertyType {
+  RESIDENTIAL
+  COMMERCIAL
+  INDUSTRIAL
+  OTHER
+}
+
+model Property {
+  id             String       @id @default(cuid())
+  customerId     String
+  customer       Customer     @relation(fields: [customerId], references: [id])
+  propertyType   PropertyType @default(RESIDENTIAL)
+  bhkOrRooms     String? // e.g. "2BHK", "5 rooms"
+  areaSqft       Float?
+  serviceAddress String
+  createdAt      DateTime  @default(now())
+  deletedAt      DateTime?
+
+  quotations   Quotation[]
+  enquiries    Enquiry[]
+  jobs         Job[]
+  amcContracts AMCContract[]
+
+  @@index([customerId])
+  @@index([deletedAt])
+}
+
+// ---------- 6. Services & 7. Pricing Management ----------
+enum PricingMethod {
+  FIXED
+  BHK
+  ROOM
+  SQFT
+  VISIT
+  UNIT
+  STATION
+  CONTRACT
+  TIERED
+}
+
+model Service {
+  id             String   @id @default(cuid())
+  name           String   @unique
+  description    String?
+  warrantyMonths Int      @default(0)
+  active         Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+  deletedAt      DateTime?
+
+  pricingRules   PricingRule[]
+  quotationItems QuotationItem[]
+  amcContracts   AMCContract[]
+
+  @@index([deletedAt])
+}
+
+// A pricing "rule set" is versioned as a whole so historical quotes can
+// reference an immutable version even after rates change (Section 11).
+model PricingRuleSetVersion {
+  id            String   @id @default(cuid())
+  version       Int      @unique @default(autoincrement())
+  label         String? // e.g. "2025 Q1 rates"
+  effectiveFrom DateTime @default(now())
+  isActive      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  rules      PricingRule[]
+  quotations Quotation[]
+}
+
+model PricingRule {
+  id            String                @id @default(cuid())
+  serviceId     String
+  service       Service               @relation(fields: [serviceId], references: [id])
+  versionId     String
+  version       PricingRuleSetVersion @relation(fields: [versionId], references: [id])
+  method        PricingMethod
+  rate          Float // base rate: per sqft / per room / per visit / per station / flat, etc.
+  minimumCharge Float                 @default(0)
+  // For TIERED pricing, tiers are stored as JSON: [{ "upTo": 1000, "rate": 8 }, { "upTo": null, "rate": 6 }]
+  tiersJson     String?
+
+  @@index([serviceId, versionId])
+}
+
+// ---------- 8. Add-ons, Surcharges & Discounts ----------
+model AddOn {
+  id     String  @id @default(cuid())
+  name   String
+  amount Float
+  active Boolean @default(true)
+
+  quotationAddOns QuotationAddOn[]
+}
+
+model Surcharge {
+  id                  String               @id @default(cuid())
+  name                String
+  amount              Float
+  requiresApproval    Boolean              @default(true)
+  active              Boolean              @default(true)
+  quotationSurcharges QuotationSurcharge[]
+}
+
+enum DiscountType {
+  PERCENT
+  FLAT
+}
+
+model DiscountRule {
+  id      String       @id @default(cuid())
+  name    String
+  type    DiscountType
+  value   Float // percent (0-100) or flat amount
+  maxRole Role         @default(SALES) // minimum role allowed to apply without extra approval
+  active  Boolean      @default(true)
+}
+
+// ---------- 9/10/11. Quotation ----------
+enum QuotationStatus {
+  DRAFT
+  SENT
+  VIEWED
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CONVERTED
+  CANCELLED
+}
+
+model Quotation {
+  id              String          @id @default(cuid())
+  quotationNumber String          @unique
+  customerId      String
+  customer        Customer        @relation(fields: [customerId], references: [id])
+  propertyId      String
+  property        Property        @relation(fields: [propertyId], references: [id])
+  status          QuotationStatus @default(DRAFT)
+
+  pricingVersionId String
+  pricingVersion   PricingRuleSetVersion @relation(fields: [pricingVersionId], references: [id])
+
+  subtotal       Float
+  discountAmount Float @default(0)
+  taxableAmount  Float
+  taxRatePercent Float @default(18) // GST %
+  taxAmount      Float
+  total          Float
+
+  // HMAC signature over the computed totals, to detect any client-side
+  // tampering before totals are persisted (integrity, Section 16).
+  totalsSignature String
+
+  discountRuleId String?
+  notes          String?
+
+  // Proposal & Treatment Terms (EPCI Proposal Structure)
+  pestTypes      String?  // e.g. "Termite, Cockroach"
+  paymentTerms   String?  // e.g. "50% Advance, 50% on Completion"
+  visitFrequency String?  // e.g. "Single", "Monthly", "Quarterly"
+  visitCount     Int?     @default(1)
+
+  createdById String
+  createdBy   User      @relation("QuotationCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  validUntil  DateTime?
+  enquiryId   String?
+  enquiry     Enquiry?  @relation(fields: [enquiryId], references: [id])
+  job         Job?
+
+  items      QuotationItem[]
+  addOns     QuotationAddOn[]
+  surcharges QuotationSurcharge[]
+  auditLogs  AuditLog[]
+
+  @@index([customerId])
+  @@index([status])
+}
+
+// Line item stores a frozen snapshot of the rate/method used, per Section 11:
+// "A quotation must preserve the pricing used when it was created."
+model QuotationItem {
+  id          String    @id @default(cuid())
+  quotationId String
+  quotation   Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  serviceId   String
+  service     Service   @relation(fields: [serviceId], references: [id])
+
+  methodSnapshot        PricingMethod
+  rateSnapshot          Float
+  minimumChargeSnapshot Float
+  quantity              Float // area in sqft, or count of rooms/BHK/visits/units/stations
+  lineTotal             Float
+}
+
+model QuotationAddOn {
+  id             String    @id @default(cuid())
+  quotationId    String
+  quotation      Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  addOnId        String
+  addOn          AddOn     @relation(fields: [addOnId], references: [id])
+  amountSnapshot Float
+}
+
+model QuotationSurcharge {
+  id             String    @id @default(cuid())
+  quotationId    String
+  quotation      Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  surchargeId    String
+  surcharge      Surcharge @relation(fields: [surchargeId], references: [id])
+  amountSnapshot Float
+  approvedByRole Role?
+}
+
+// ---------- 16. Audit Log ----------
+model AuditLog {
+  id          String     @id @default(cuid())
+  userId      String
+  user        User       @relation(fields: [userId], references: [id])
+  quotationId String?
+  quotation   Quotation? @relation(fields: [quotationId], references: [id])
+  action      String // e.g. "PRICE_OVERRIDE", "DISCOUNT_APPLIED", "STATUS_CHANGE"
+  detail      String
+  createdAt   DateTime   @default(now())
+}
+
+// ---------- Full Business Management Modules ----------
+enum EnquiryStatus {
+  NEW
+  CONTACTED
+  SITE_VISIT
+  QUOTATION_SENT
+  NEGOTIATION
+  WON
+  LOST
+}
+
+enum EnquirySource {
+  PHONE
+  WHATSAPP
+  WEBSITE
+  WALK_IN
+  REFERRAL
+  OTHER
+}
+
+enum FollowUpStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+enum JobStatus {
+  SCHEDULED
+  ASSIGNED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIAL
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  UPI
+  BANK_TRANSFER
+  CARD
+  CHEQUE
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  REFUNDED
+}
+
+enum AMCStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum JobVisitStatus {
+  SCHEDULED
+  STARTED
+  COMPLETED
+  MISSED
+  CANCELLED
+}
+
+model Enquiry {
+  id            String        @id @default(cuid())
+  enquiryNumber String        @unique
+  customerId    String?
+  customer      Customer?     @relation(fields: [customerId], references: [id])
+  propertyId    String?
+  property      Property?     @relation(fields: [propertyId], references: [id])
+  contactName   String
+  mobile        String
+  source        EnquirySource @default(PHONE)
+  requirement   String
+  pestType      String?       // Inspection pest type (e.g. "Termite, Bed Bug")
+  infestationLevel String?    // Inspection level (e.g. "Low", "Moderate", "High", "Severe")
+  inspectionNotes  String?    // Site inspection observations
+  notes         String?
+  status        EnquiryStatus @default(NEW)
+  createdById   String
+  createdBy     User          @relation("EnquiryCreatedBy", fields: [createdById], references: [id])
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?
+  followUps     FollowUp[]
+  quotations    Quotation[]
+
+  @@index([mobile])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+model FollowUp {
+  id           String         @id @default(cuid())
+  enquiryId    String?
+  enquiry      Enquiry?       @relation(fields: [enquiryId], references: [id], onDelete: Cascade)
+  customerId   String?
+  customer     Customer?      @relation(fields: [customerId], references: [id])
+  dueAt        DateTime
+  note         String
+  status       FollowUpStatus @default(PENDING)
+  assignedToId String?
+  assignedTo   User?          @relation("FollowUpAssignedTo", fields: [assignedToId], references: [id])
+  completedAt  DateTime?
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  deletedAt    DateTime?
+
+  @@index([dueAt, status])
+  @@index([deletedAt])
+}
+
+model Technician {
+  id     String  @id @default(cuid())
+  userId String? @unique
+
+  name         String
+  mobile       String
+  employeeCode String? @unique
+  active       Boolean @default(true)
+  skills       String?
+  notes        String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  user        User?           @relation(fields: [userId], references: [id])
+  assignments JobAssignment[]
+  visits      JobVisit[]
+  amcVisits   AMCVisit[]
+
+  @@index([deletedAt])
+}
+
+model Job {
+  id          String          @id @default(cuid())
+  jobNumber   String          @unique
+  quotationId String?         @unique
+  quotation   Quotation?      @relation(fields: [quotationId], references: [id])
+  customerId  String
+  customer    Customer        @relation(fields: [customerId], references: [id])
+  propertyId  String
+  property    Property        @relation(fields: [propertyId], references: [id])
+  status      JobStatus       @default(SCHEDULED)
+  scheduledAt DateTime?
+  notes       String?
+  createdById String
+  createdBy   User            @relation("JobCreatedBy", fields: [createdById], references: [id])
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  assignments JobAssignment[]
+  visits      JobVisit[]
+  invoice     Invoice?
+
+  @@index([status])
+  @@index([scheduledAt])
+}
+
+model JobAssignment {
+  id           String     @id @default(cuid())
+  jobId        String
+  job          Job        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  technicianId String
+  technician   Technician @relation(fields: [technicianId], references: [id])
+  assignedAt   DateTime   @default(now())
+  notes        String?
+
+  @@unique([jobId, technicianId])
+}
+
+model JobVisit {
+  id             String         @id @default(cuid())
+  jobId          String
+  job            Job            @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  technicianId   String?
+  technician     Technician?    @relation(fields: [technicianId], references: [id])
+  scheduledAt    DateTime
+  startedAt      DateTime?
+  completedAt    DateTime?
+  status         JobVisitStatus @default(SCHEDULED)
+  notes          String?
+  chemicalUsed   String?
+  customerSigned Boolean        @default(false)
+  createdAt      DateTime       @default(now())
+
+  @@index([scheduledAt])
+}
+
+model Invoice {
+  id             String        @id @default(cuid())
+  invoiceNumber  String        @unique
+  jobId          String        @unique
+  job            Job           @relation(fields: [jobId], references: [id])
+  customerId     String
+  customer       Customer      @relation(fields: [customerId], references: [id])
+  subtotal       Float
+  taxRatePercent Float         @default(18)
+  taxAmount      Float
+  total          Float
+  paidAmount     Float         @default(0)
+  balanceAmount  Float
+  status         InvoiceStatus @default(ISSUED)
+  issuedAt       DateTime      @default(now())
+  dueAt          DateTime?
+  notes          String?
+  payments       Payment[]
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([status])
+  @@index([customerId])
+}
+
+model Payment {
+  id            String        @id @default(cuid())
+  receiptNumber String        @unique
+  invoiceId     String
+  invoice       Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  amount        Float
+  method        PaymentMethod
+  status        PaymentStatus @default(SUCCESS)
+  reference     String?
+  paidAt        DateTime      @default(now())
+  notes         String?
+  recordedById  String
+  recordedBy    User          @relation("PaymentRecordedBy", fields: [recordedById], references: [id])
+  createdAt     DateTime      @default(now())
+
+  @@index([paidAt])
+}
+
+model AMCContract {
+  id             String     @id @default(cuid())
+  contractNumber String     @unique
+  customerId     String
+  customer       Customer   @relation(fields: [customerId], references: [id])
+  propertyId     String
+  property       Property   @relation(fields: [propertyId], references: [id])
+  serviceId      String
+  service        Service    @relation(fields: [serviceId], references: [id])
+  startDate      DateTime
+  endDate        DateTime
+  visitFrequency String
+  visitCount     Int        @default(12)
+  contractValue  Float
+  status         AMCStatus  @default(ACTIVE)
+  notes          String?
+  visits         AMCVisit[]
+  createdById    String
+  createdBy      User       @relation("AMCCreatedBy", fields: [createdById], references: [id])
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  @@index([status, endDate])
+}
+
+model AMCVisit {
+  id           String         @id @default(cuid())
+  contractId   String
+  contract     AMCContract    @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  scheduledAt  DateTime
+  completedAt  DateTime?
+  technicianId String?
+  technician   Technician?    @relation(fields: [technicianId], references: [id])
+  status       JobVisitStatus @default(SCHEDULED)
+  notes        String?
+  createdAt    DateTime       @default(now())
+
+  @@index([scheduledAt])
+}
+
+// Additional relations on existing models
